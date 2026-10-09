@@ -1,0 +1,133 @@
+---
+name: weekend-enrichment-agent
+description: Cloud-routine variant of the outbound-agent pipeline for unattended weekend runs
+---
+
+# Weekend Cloud Enrichment Agent — Operating Spec
+
+This is the cloud-routine variant of `outbound-agent` (see that skill for the canonical interactive process). It exists for one reason: the interactive `outbound-agent` session depends on local MCP servers (Smartlead) that are only reachable from the user's own machine, so it cannot run unattended while the device is off. This spec runs the **research + enrichment** half of the same pipeline as a claude.ai scheduled cloud routine (`RemoteTrigger`), so a batch of accounts can be fully researched and verified over a weekend — with the Smartlead push always left for a live interactive session afterward.
+
+**Do not run this from memory of a prior conversation.** Every fire of the routine is a fresh cloud session with no memory of earlier fires except what it reads back from its own Artifact. Treat every instruction below as something the prompt itself must restate each time, not something the agent "already knows."
+
+## 1. Scope: what this agent does and does not do
+
+Does:
+- Company-level research (web search/fetch) for the enrichment variables a target campaign's sequence needs.
+- Contact discovery + email verification via Clay (`search-contacts`, `run_subroutine` Work Email, `add-contact-data-points` Summarize Work History).
+- Assembly of the full per-lead merge-variable set, with every field set to either a real sourced value or the exact documented fallback — never a missing key.
+- Writing all of this to a resumable Claude Artifact so progress survives across hourly fires and is retrievable from any device Monday.
+
+Never does:
+- Call any Smartlead tool, or push a single lead anywhere. Smartlead is a local-only MCP server and is never attached as a connector on this routine — structurally, not just by instruction, it cannot reach it.
+- Guess or invent a value for any field. Every hard no-fabrication rule in `outbound-agent` §2 applies unchanged here — a candidate without a verified email is dropped, a company signal without a real source is left as its documented fallback, nothing is fabricated to look fuller than it is.
+
+## 2. Why a cloud routine needs different plumbing than the interactive agent
+
+- **No shared filesystem.** A cloud routine session does not share local disk with the machine that created it. Local scratchpad files, CSV exports, or anything written to `/private/tmp/...` disappears with that session and is not retrievable later. All durable state must live in a **Claude Artifact**, which is hosted on claude.ai and reachable from any later session regardless of device.
+- **No local MCP servers.** Only `claude.ai` connectors (the account's own connected apps, e.g. Clay) can be attached to a routine. Smartlead, being configured locally via `claude mcp add`, cannot be attached at all — this is the structural guarantee that this agent can never push anything.
+- **Every fire is a new session.** A recurring routine's cron fire has no memory of the previous fire. The only way it "remembers" what's been done is by reading its own previously-published Artifact back at the start of each fire.
+- **Minimum fire interval is 1 hour.** Batch size per fire should be sized so one fire's work reliably finishes well inside that hour (empirically, ~50 companies of full research + Clay enrichment takes well under an hour sequentially — see §6).
+
+## 3. Resumable state — the Artifact is the only memory this agent has
+
+Pick one fixed, descriptive Artifact title for the run (e.g. `"<campaign>_weekend_enrichment"`) and use it exactly, every fire.
+
+**At the start of every fire:**
+1. `Artifact({action: "list", scope: "mine", limit: 50})` — find the artifact with that exact title.
+2. If found: `Artifact({action: "read", url: <that url>})`, and parse the hidden state blob embedded as `<script type="application/json" id="state">...</script>` in the page source. If not found, this is the first fire — initialize fresh state.
+3. State shape:
+   ```json
+   {
+     "done": [ /* one entry per fully-processed company, see §7 schema */ ],
+     "remaining_domains": [ /* domains not yet attempted */ ],
+     "quota_baseline_percent": null,
+     "complete": false,
+     "stopped_reason": null
+   }
+   ```
+4. If `state.complete` is already `true`, stop immediately — there is nothing left to do this fire.
+
+**At the end of every fire:** republish the *same* artifact (pass its existing `url` so it updates in place) with an updated state blob and a human-readable table of everything in `state.done` so far — company, domain, contacts, and a compact view of the researched variables. This page is what gets opened Monday to review before pushing.
+
+## 4. Quota safety gate — checked at the start of every fire, before touching any company
+
+The weekly usage budget approved for this kind of run is **25 percentage points above whatever the weekly usage was when the run started** — not an absolute ceiling (the account is typically already well above a flat 25% from unrelated daily work, so a flat ceiling would mean the run never starts at all).
+
+1. On the very first fire (when `state.quota_baseline_percent` is `null`), attempt `mcp__ccd_session_mgmt__get_usage` (load it first via `ToolSearch` with query `"select:mcp__ccd_session_mgmt__get_usage"` if it's deferred). Read `plan.windows` for the entry labeled `"Weekly · all models"` and its `percentUsed`. Store that number as `state.quota_baseline_percent` before doing anything else.
+2. On every fire (including the first, after capturing the baseline), call it again and compare current `percentUsed` to the stored baseline.
+3. If `current - baseline >= 25`, **stop immediately**: do not process any companies this fire, set `state.stopped_reason = "quota cap reached"`, republish the artifact noting this clearly at the top of the page, and leave `state.complete = false` (so a human knows it was a deliberate stop, not a finished run).
+4. **Confirmed broken, not just unknown (2026-10-09 live test):** `mcp__ccd_session_mgmt__get_usage` does not exist inside a cloud routine session — ToolSearch doesn't surface it, and a direct call returns `"No such tool available"`. Steps 1–3 above cannot run as written; this gate is currently a no-op. **Decision on a replacement is pending** (the user said "we will see what to do" — not yet resolved as of this writing). Do not silently skip accounting for cost just because this gate can't run — if no replacement has been specified by the time this spec is used, treat that as a reason to confirm scope with the user before an unattended run, not a reason to proceed uncapped by default.
+
+## 5. Company research (per `outbound-agent` §5 — unchanged)
+
+Company-level research does **not** use Clay. For each company, in order of preference:
+1. Use any tech-stack/traffic/installed-apps data already supplied in the input list — treat it as sufficient, no need to re-verify.
+2. Otherwise do genuine web research (`WebSearch`/`WebFetch`) — the company's own site, job postings, press, etc.
+3. A case-study quote, growth stat, or named competitor benchmark must be sourced and citable. If none exists, the corresponding field gets its documented empty/sentinel fallback — never an invented one.
+
+## 6. Contact + email discovery (per `outbound-agent` §4 — unchanged)
+
+Run the standard Clay filter per batch of up to 10 domains per `search-contacts` call:
+```
+select from people where
+  experiences.any(
+    is_current = true
+    and seniority in ("Founder", "Owner", "VP", "Head", "Director", "C-suite")
+    and job_title is_similar_to ("customer success", "customer experience", "Marketing", "Sales", "ecommerce", "e-commerce", "digital")
+  )
+limit 3 by clay_company_id
+```
+Broadened-seniority fallback (add "Manager") only after a zero-result first pass; no bare company-name fallback (confirmed broken). Cap at 3 enriched candidates per company. Verify every candidate's email via the Work Email subroutine (`t_0tl41guQrDBpYmSWuVN`) and current employment via Summarize Work History before counting them as resolved. Run Clay calls **sequentially, one at a time** inside a single routine fire — do not fan out to concurrent subagents from within the routine; the account's Clay workspace has a confirmed low concurrency ceiling, and a single sequential caller is always safe.
+
+**Company-match verification (added after a confirmed bad match in testing):** `search-contacts` can resolve a supplied domain to the wrong entity — observed live: `hoover.com` (the appliance brand) matched to "Hoover Sales and Service," an unrelated 2–10 person Tennessee shop, and returned contacts for that wrong company. Before accepting any result for a domain, check that Clay's returned company record (its own name/domain/size) is actually consistent with what was supplied for that domain — a company many times smaller than expected, a materially different name, or a domain that doesn't match is a sign of a bad match, not a real company. **If the match looks wrong, mark that company `not_found` rather than accepting its contacts or guessing which part is right.** This is a drop decision, same as any other no-fabrication drop — do not try to salvage a wrong-company match.
+
+Batch size: ~50 companies per fire is a safe default (comfortably under an hour at the full research+contacts pace observed historically, ~6.5K tokens/company). Adjust down if a given list's companies are proving unusually hard to research.
+
+## 7. Per-lead output schema and merge-variable fallback table
+
+Every entry in `state.done` must carry the full merge-variable set the target sequence needs, each field set to a real value or its documented fallback — **never an omitted key**, since Smartlead renders a missing custom-field key as the literal unresolved `{{tag}}` text in the sent email.
+
+```json
+{
+  "company_name": "...",
+  "domain": "...",
+  "contacts": [
+    {"name": "...", "title": "...", "email": "...", "linkedin_url": "...", "confidence_flag": "confirmed current | domain_mismatch_flagged | not_found"}
+  ],
+  "merge_variables": {
+    "top_signal": "... or 'No verified signal found.'",
+    "incumbent_vendor": "... or 'No incumbent vendor identified.'",
+    "incumbent_metric": "... or ''",
+    "industry_usecase": "...",
+    "manifest_capability": "...",
+    "platform": "...",
+    "traffic": "...",
+    "exec_hire_name": "... or 'No qualifying executive hire found.'",
+    "title_hiring": "... or ''",
+    "rloe_connection": "... or ''",
+    "competitor_benchmark": "... or ''",
+    "case_study_quote": "... or ''"
+  },
+  "notes": "..."
+}
+```
+
+Fallback mechanism per field — reproduced from `outbound-agent` §7, this is the authoritative table and must not drift from it:
+
+| Variable | Populated when | Fallback |
+|---|---|---|
+| `top_signal` | Always — strongest verified evidence | Sentinel `"No verified signal found."` |
+| `incumbent_vendor` | A named tool is confirmed | Sentinel `"No incumbent vendor identified."` |
+| `incumbent_metric` | A named stat is confirmed | Empty string `""` |
+| `industry_usecase` / `manifest_capability` / `platform` / `traffic` | Always, from research | — |
+| `exec_hire_name` | A real, sourced recent senior hire exists | Sentinel `"No qualifying executive hire found."` |
+| `title_hiring` | A real, found job posting exists | Empty string `""` |
+| `rloe_connection` | Independently verified | Empty string `""` |
+| `competitor_benchmark` | A real, sourced, citable case study/peer brand exists | Empty string `""` |
+| `case_study_quote` | A real, correctly-attributed quote exists | Empty string `""`, never reassigned to a different person |
+
+`suggested_date`, `suggested_time`, `calendly_link`, `founder_linkedin`, `playbook_link` are static/computed-at-send-time fields — this agent does not need to populate them; they stay the sequence's own standing values.
+
+## 8. End of a run
+
+When `state.remaining_domains` is empty, set `state.complete = true` and publish a final summary: total companies processed, hit rate, total verified contacts, total leads with a full merge-variable set ready to push, and a clear flag on any left in a degraded state (e.g., contact found but no company signal confirmed). This final artifact is the handoff document for the Monday interactive session — review it there, then push to Smartlead from that session, never from this one.

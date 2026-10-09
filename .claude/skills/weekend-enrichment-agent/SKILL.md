@@ -12,7 +12,7 @@ This is the cloud-routine variant of `outbound-agent` (see that skill for the ca
 ## 1. Scope: what this agent does and does not do
 
 Does:
-- Company-level research (web search/fetch) for the enrichment variables a target campaign's sequence needs.
+- Company-level research (web search/fetch) for the enrichment variables listed in §7.
 - Contact discovery + email verification via Clay (`search-contacts`, `run_subroutine` Work Email, `add-contact-data-points` Summarize Work History).
 - Assembly of the full per-lead merge-variable set, with every field set to either a real sourced value or the exact documented fallback — never a missing key.
 - Writing all of this to a resumable Claude Artifact so progress survives across hourly fires and is retrievable from any device Monday.
@@ -30,7 +30,7 @@ Never does:
 
 ## 3. Resumable state — the Artifact is the only memory this agent has
 
-Pick one fixed, descriptive Artifact title for the run (e.g. `"<campaign>_weekend_enrichment"`) and use it exactly, every fire.
+Use the fixed Artifact title `"weekend_enrichment"` (there is no campaign name — Smartlead is not used for this run) and use it exactly, every fire.
 
 **At the start of every fire:**
 1. `Artifact({action: "list", scope: "mine", limit: 50})` — find the artifact with that exact title.
@@ -49,14 +49,9 @@ Pick one fixed, descriptive Artifact title for the run (e.g. `"<campaign>_weeken
 
 **At the end of every fire:** republish the *same* artifact (pass its existing `url` so it updates in place) with an updated state blob and a human-readable table of everything in `state.done` so far — company, domain, contacts, and a compact view of the researched variables. This page is what gets opened Monday to review before pushing.
 
-## 4. Quota safety gate — checked at the start of every fire, before touching any company
+## 4. Usage budget — no cap
 
-The weekly usage budget approved for this kind of run is **25 percentage points above whatever the weekly usage was when the run started** — not an absolute ceiling (the account is typically already well above a flat 25% from unrelated daily work, so a flat ceiling would mean the run never starts at all).
-
-1. On the very first fire (when `state.quota_baseline_percent` is `null`), attempt `mcp__ccd_session_mgmt__get_usage` (load it first via `ToolSearch` with query `"select:mcp__ccd_session_mgmt__get_usage"` if it's deferred). Read `plan.windows` for the entry labeled `"Weekly · all models"` and its `percentUsed`. Store that number as `state.quota_baseline_percent` before doing anything else.
-2. On every fire (including the first, after capturing the baseline), call it again and compare current `percentUsed` to the stored baseline.
-3. If `current - baseline >= 25`, **stop immediately**: do not process any companies this fire, set `state.stopped_reason = "quota cap reached"`, republish the artifact noting this clearly at the top of the page, and leave `state.complete = false` (so a human knows it was a deliberate stop, not a finished run).
-4. **Confirmed broken, not just unknown (2026-10-09 live test):** `mcp__ccd_session_mgmt__get_usage` does not exist inside a cloud routine session — ToolSearch doesn't surface it, and a direct call returns `"No such tool available"`. Steps 1–3 above cannot run as written; this gate is currently a no-op. **Decision on a replacement is pending** (the user said "we will see what to do" — not yet resolved as of this writing). Do not silently skip accounting for cost just because this gate can't run — if no replacement has been specified by the time this spec is used, treat that as a reason to confirm scope with the user before an unattended run, not a reason to proceed uncapped by default.
+There is no usage cap for this run (decided by the user, 2026-10-09). `mcp__ccd_session_mgmt__get_usage` does not exist inside a cloud routine session, so do not try to call it and do not stop or ask for confirmation over usage. The run ends only when `state.remaining_domains` is empty (§8). `state.quota_baseline_percent` stays `null`.
 
 ## 5. Company research (per `outbound-agent` §5 — unchanged)
 
@@ -85,7 +80,7 @@ Batch size: ~50 companies per fire is a safe default (comfortably under an hour 
 
 ## 7. Per-lead output schema and merge-variable fallback table
 
-Every entry in `state.done` must carry the full merge-variable set the target sequence needs, each field set to a real value or its documented fallback — **never an omitted key**, since Smartlead renders a missing custom-field key as the literal unresolved `{{tag}}` text in the sent email.
+Every entry in `state.done` must carry the full merge-variable set the target sequence needs, each field set to a real value or its documented fallback — **never an omitted key**, since whatever tool later sends the emails renders a missing key as literal unresolved `{{tag}}` text.
 
 ```json
 {
@@ -130,4 +125,4 @@ Fallback mechanism per field — reproduced from `outbound-agent` §7, this is t
 
 ## 8. End of a run
 
-When `state.remaining_domains` is empty, set `state.complete = true` and publish a final summary: total companies processed, hit rate, total verified contacts, total leads with a full merge-variable set ready to push, and a clear flag on any left in a degraded state (e.g., contact found but no company signal confirmed). This final artifact is the handoff document for the Monday interactive session — review it there, then push to Smartlead from that session, never from this one.
+When `state.remaining_domains` is empty, set `state.complete = true` and publish a final summary: total companies processed, hit rate, total verified contacts, total leads with a full merge-variable set ready to push, and a clear flag on any left in a degraded state (e.g., contact found but no company signal confirmed). This final artifact is the handoff document for the Monday interactive session — review it there before any lead is pushed anywhere; this agent never pushes.

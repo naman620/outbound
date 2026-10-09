@@ -49,6 +49,12 @@ Use the fixed Artifact title `"weekend_enrichment"` (there is no campaign name �
 
 **At the end of every fire:** republish the *same* artifact (pass its existing `url` so it updates in place) with an updated state blob and a human-readable table of everything in `state.done` so far — company, domain, contacts, and a compact view of the researched variables. This page is what gets opened Monday to review before pushing.
 
+**The contacts sheet — rebuilt and published on every fire.** Alongside the page, publish one cumulative `contacts.csv` through the publish call's `files` (e.g. `files: {"contacts.csv": "<scratchpad>/contacts.csv"}`), and put a prominent "Download contacts (CSV)" link to `contacts.csv` at the top of the page. Rules:
+- Rebuild the whole file from `state.done` every fire — never append to the previous fire's file — so it always holds every company processed so far, with no duplicates.
+- One row per verified contact (a contact with a verified email). A company with no verified contact still gets one row with the contact columns empty, so nothing processed is missing from the sheet.
+- Columns, in this order: `company_name, domain, contact_name, title, email, linkedin_url, confidence_flag`, then every `merge_variables` key from §7 in the order listed there, then `notes`.
+- Write it with a real CSV writer (Python's `csv` module): UTF-8, header row, every field quoted where needed, so commas, quotes and newlines in researched text can't break the columns.
+
 ## 4. Usage budget — no cap
 
 There is no usage cap for this run (decided by the user, 2026-10-09). `mcp__ccd_session_mgmt__get_usage` does not exist inside a cloud routine session, so do not try to call it and do not stop or ask for confirmation over usage. The run ends only when `state.remaining_domains` is empty (§8). `state.quota_baseline_percent` stays `null`.
@@ -125,4 +131,4 @@ Fallback mechanism per field — reproduced from `outbound-agent` §7, this is t
 
 ## 8. End of a run
 
-When `state.remaining_domains` is empty, set `state.complete = true` and publish a final summary: total companies processed, hit rate, total verified contacts, total leads with a full merge-variable set ready to push, and a clear flag on any left in a degraded state (e.g., contact found but no company signal confirmed). This final artifact is the handoff document for the Monday interactive session — review it there before any lead is pushed anywhere; this agent never pushes.
+When `state.remaining_domains` is empty, set `state.complete = true` and publish a final summary: total companies processed, hit rate, total verified contacts, total leads with a full merge-variable set ready to push, and a clear flag on any left in a degraded state (e.g., contact found but no company signal confirmed). The final `contacts.csv` holds every company and contact from the whole run. This final artifact is the handoff document for the Monday interactive session — review it there before any lead is pushed anywhere; this agent never pushes.

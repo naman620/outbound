@@ -34,18 +34,25 @@ Use the fixed Artifact title `"weekend_enrichment"` (there is no campaign name �
 
 **At the start of every fire:**
 1. `Artifact({action: "list", scope: "mine", limit: 50})` — find the artifact with that exact title.
-2. If found: `Artifact({action: "read", url: <that url>})`, and parse the hidden state blob embedded as `<script type="application/json" id="state">...</script>` in the page source. If not found, this is the first fire — initialize fresh state.
+2. If found: `Artifact({action: "read", url: <that url>})`, and parse the hidden state blob embedded as `<script type="application/json" id="state">...</script>` in the page source. If not found, this is the first fire — initialize fresh state, with `remaining_domains` read from `inputs/domains.csv` (see "Inputs" below).
 3. State shape:
    ```json
    {
      "done": [ /* one entry per fully-processed company, see §7 schema */ ],
      "remaining_domains": [ /* domains not yet attempted */ ],
-     "quota_baseline_percent": null,
+     "companies_attempted": 0,
+     "cost_usd_log": [ /* one number per fire: that fire's session cost_usd */ ],
      "complete": false,
      "stopped_reason": null
    }
    ```
-4. If `state.complete` is already `true`, stop immediately — there is nothing left to do this fire.
+4. If `state.complete` is already `true`, or `state.stopped_reason` is set, stop immediately — there is nothing left to do this fire.
+
+**Inputs — both live in the repo (`naman620/outbound`, branch `claude/new-session-9jzppy`), not in the prompt:**
+- `inputs/domains.csv` — header row with a `domain` column; any other columns (tech stack, traffic, installed apps, company name) are supplied data to use per §5.1. Read only on the first fire; later fires work from `state.remaining_domains`.
+- `inputs/run_config.json` — `{"max_companies": <int>}`, the usage cap from §4. Read on every fire, so the cap can be changed mid-run by committing a new value.
+
+If the session has no checkout of the repo, read both files with the GitHub MCP `get_file_contents` tool. If either file is missing or `max_companies` is not a positive integer, process nothing: publish the page with `stopped_reason = "inputs missing"` stated at the top.
 
 **At the end of every fire:** republish the *same* artifact (pass its existing `url` so it updates in place) with an updated state blob and a human-readable table of everything in `state.done` so far — company, domain, contacts, and a compact view of the researched variables. This page is what gets opened Monday to review before pushing.
 
@@ -55,9 +62,13 @@ Use the fixed Artifact title `"weekend_enrichment"` (there is no campaign name �
 - Columns, in this order: `company_name, domain, contact_name, title, email, linkedin_url, confidence_flag`, then every `merge_variables` key from §7 in the order listed there, then `notes`.
 - Write it with a real CSV writer (Python's `csv` module): UTF-8, header row, every field quoted where needed, so commas, quotes and newlines in researched text can't break the columns.
 
-## 4. Usage budget — no cap
+## 4. Usage budget — stay under 70% of the weekly limit
 
-There is no usage cap for this run (decided by the user, 2026-10-09). `mcp__ccd_session_mgmt__get_usage` does not exist inside a cloud routine session, so do not try to call it and do not stop or ask for confirmation over usage. The run ends only when `state.remaining_domains` is empty (§8). `state.quota_baseline_percent` stays `null`.
+The user's limit for this run is **70% of the weekly Claude usage limit**. No tool in a cloud session reports the weekly percentage (`mcp__ccd_session_mgmt__get_usage` does not exist there — do not call it), so the limit is enforced as a company count calibrated by the user:
+
+- `max_companies` in `inputs/run_config.json` = (70 − weekly % at start) ÷ (weekly % per company, measured on a test fire), minus a 10% buffer. The user sets it; never change it yourself.
+- Before each company, if `state.companies_attempted >= max_companies`, stop: set `state.stopped_reason = "usage cap reached"`, republish with that stated at the top, and leave `state.complete = false`. Every company taken from `remaining_domains` counts as attempted, whether or not it yields contacts.
+- At the end of every fire, call `mcp__claude-code-remote__get_session` with no `session_id` and append `external_metadata.usage.cost_usd` to `state.cost_usd_log`, and show the running total on the page. If `external_metadata.rate_limit_info.status` is anything other than `"allowed"`, or `isUsingOverage` is `true`, set `state.stopped_reason = "rate limit warning"` and stop processing.
 
 ## 5. Company research (per `outbound-agent` §5 — unchanged)
 

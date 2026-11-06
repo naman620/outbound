@@ -77,7 +77,9 @@ Company-level research does **not** use Clay. For each company, in order of pref
 2. Otherwise do genuine web research (`WebSearch`/`WebFetch`) — the company's own site, job postings, press, etc.
 3. A case-study quote, growth stat, or named competitor benchmark must be sourced and citable. If none exists, the corresponding field gets its documented empty/sentinel fallback — never an invented one.
 
-## 6. Contact + email discovery (per `outbound-agent` §4 — unchanged)
+## 6. Contact + email discovery (per `outbound-agent` §4, with a narrower title filter)
+
+Only three functions buy an AI shopping/support assistant, so contacts are limited to them: **digital transformation, customer experience (CX) and eCommerce**. Marketing, sales and other roles are out of scope, even when senior.
 
 Run the standard Clay filter per batch of up to 10 domains per `search-contacts` call:
 ```
@@ -85,10 +87,12 @@ select from people where
   experiences.any(
     is_current = true
     and seniority in ("Founder", "Owner", "VP", "Head", "Director", "C-suite")
-    and job_title is_similar_to ("customer success", "customer experience", "Marketing", "Sales", "ecommerce", "e-commerce", "digital")
+    and job_title is_similar_to ("digital transformation", "customer experience", "CX", "ecommerce", "e-commerce", "digital commerce")
   )
 limit 3 by clay_company_id
 ```
+`is_similar_to` matches loosely and can return adjacent roles, so screen every candidate's actual title before enriching: keep a person only if the title names digital transformation, customer experience / CX, or eCommerce / digital commerce (e.g. "VP Ecommerce", "Head of Customer Experience", "Director of Digital Transformation", "Chief Digital Officer"). Drop titles that are only marketing, sales, customer service operations or IT, and say who was dropped and why in the company's notes.
+
 Broadened-seniority fallback (add "Manager") only after a zero-result first pass; no bare company-name fallback (confirmed broken). Cap at 3 enriched candidates per company. Verify every candidate's email via the Work Email subroutine (`t_0tl41guQrDBpYmSWuVN`) and current employment via Summarize Work History before counting them as resolved. Run Clay calls **sequentially, one at a time** inside a single routine fire — do not fan out to concurrent subagents from within the routine; the account's Clay workspace has a confirmed low concurrency ceiling, and a single sequential caller is always safe.
 
 **Company-match verification (added after a confirmed bad match in testing):** `search-contacts` can resolve a supplied domain to the wrong entity — observed live: `hoover.com` (the appliance brand) matched to "Hoover Sales and Service," an unrelated 2–10 person Tennessee shop, and returned contacts for that wrong company. Before accepting any result for a domain, check that Clay's returned company record (its own name/domain/size) is actually consistent with what was supplied for that domain — a company many times smaller than expected, a materially different name, or a domain that doesn't match is a sign of a bad match, not a real company. **If the match looks wrong, mark that company `not_found` rather than accepting its contacts or guessing which part is right.** This is a drop decision, same as any other no-fabrication drop — do not try to salvage a wrong-company match.
